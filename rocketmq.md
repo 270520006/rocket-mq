@@ -154,4 +154,4 @@ docker run -d \
 pangliang/rocketmq-console-ng
 ```
 
-至此，rocket-mq搭建完成，踩了许多坑，真的烦。
+至此，rocket-mq搭建完成，踩了许多坑，真的烦。访问地址：http://192.168.56.101:9999/#/
