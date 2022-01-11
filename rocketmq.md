@@ -160,9 +160,128 @@ return this.sendKernelimpl(msg,mq，communicationMode，sendcallback,timeout )
   * 原理：利用一张日志表来记录已经处理成功的消息的ID，如果新到的消息ID已经在日志表中，那么就不在处理这条消息。
   * 解决方案：由消息系统实现，也可以由业务端实现。正常情况下出现重复消息的概率其实很小，如果由消息系统来实现的话，肯定会对消息系统的吞吐量和高可用有影响，所以最好还是由业务端自己处理消息重复的问题，这也是RocketMQ不解决消息重复问题的原因。RocketMQ不保证消息不重复，如果你的业务系统需要保证严格的不重复消息,需要你自己在业务端去重。
 
+### 事务消息
+
+* 引入案例：小明购买一个100元的东西，账户扣款100元的同时需要保证在下游的积分系统给小明这个账号增加100积分。账号系统和积分系统是两个独立是系统，一个要减少100元，一个要增加100积分。
+* 问题
+  * 账号服务扣款成功了，通知积分系统也成功了，但是积分增加的时候失败了，数据不一致了。
+  * 账号服务扣款成功了，但是通知积分系统失败了，所以积分不会增加，数据不一致了。
+* 解决方案
+  * RocketMQ针对第一个问题解决方案是：如果消费失败了，是会自动重试的，如果重试几次后还是消费失败，那么这种情况就需要人工解决了，比如放到死信队列里然后手动查原因进行处理等。
+  * RocketMQ针对第二个问题解决方案是：如果你扣款成功了，但是往mq写消息的时候失败了，那么RocketMQ会进行回滚消息的操作，这时候我们也能回滚我们扣款的操作。
+
+![image-20220110094554671](rocketmq/image-20220110094554671.png)
+
+* 原理图解
+  * Producer发送半消息（Half Message）到broker。
+  * Half Message发送成功后开始执行本地事务。
+  * 如果本地事务执行成功的话则返回commit，如果执行失败则返回rollback。（这个是在事务消息的回调方法里由开发者自己决定commit or rollback）Producer发送上一步的commit还是rollback到broker，这里有两种情况：
+    * 如果broker收到了commit/rollback消息
+      * 如果收到了commit，则broker认为整个事务是没问题的，执行成功的。那么会下发消息给Consumer端消费。
+      * 如果收到了rollback，则broker认为本地事务执行失败了，broker将会删除Half Message，不下发给Consumer端。
+    * 如果broker未收到消息（如果执行本地事务突然宕机了，相当本地事务执行结果返回unknow，则和broker未收到确认消息的情况一样处理。）
+      * broker会定时回查本地事务的执行结果：如果回查结果是本地事务已经执行则返回commit，若未执行，则返回rollback。
+      * Producer端回查的结果发送给Broker。Broker接收到的如果是commit，则broker视为整个事务执行成功，如果是rollback，则broker视为本地事务执行失败，broker删除Half Message，不下发给consumer。如果broker未接收到回查的结果（或者查到的是unknow），则broker会定时进行重复回查，以确保查到最终的事务结果。重复回查的时间间隔和次数都可配。
+
+总结：事务消息是个监听器，有回调函数，回调函数里我们进行业务逻辑的操作，比如给账户-100元，然后发消息到积分的mq里，这时候如果账户-100成功了，且发送到mq成功了，则设置消息状态为commit，这时候broker会将这个半消息发送到真正的topic中。一开始发送他是存到半消息队列里的，并没存在真实topic的队列里。只有确认commit后才会转移。
+
+![image-20220110111745966](rocketmq/image-20220110111745966.png)
+
+​	补救方案：如果事务因为中断，或是其他的网络原因，导致无法立即响应的，RocketMQ当做UNKNOW处理，RocketMQ事务消息还提供了一个补救方案：定时查询事务消息的事务状态。这也是一个回调函数，这里面可以做补偿，补偿逻辑开发者自己写，成功的话自己返回commit就完事了。
+
+* 实现代码
+
+```java
+import org.apache.rocketmq.client.producer.LocalTransactionState;
+import org.apache.rocketmq.client.producer.TransactionListener;
+import org.apache.rocketmq.client.producer.TransactionMQProducer;
+import org.apache.rocketmq.common.message.Message;
+import org.apache.rocketmq.common.message.MessageExt;
+/**
+ * Description:
+ *
+ * @author TongWei.Chen 2020-06-21 11:32:58
+ */
+public class ProducerTransaction2 {
+    public static void main(String[] args) throws Exception {
+        TransactionMQProducer producer = new TransactionMQProducer("my-producer-group");
+        producer.setNamesrvAddr("192.168.56.101:9876");
+        // 回调
+        producer.setTransactionListener(new TransactionListener() {
+            /**
+             * 用于监听是否回传
+             * 用于UNKNOW
+             */
+            @Override
+            public LocalTransactionState executeLocalTransaction(Message message, Object arg) {
+                LocalTransactionState state = null;
+                //msg-4返回COMMIT_MESSAGE
+                if(message.getKeys().equals("msg-1")){
+                    state = LocalTransactionState.COMMIT_MESSAGE;
+                }
+                //msg-5返回ROLLBACK_MESSAGE
+                else if(message.getKeys().equals("msg-2")){
+                    state = LocalTransactionState.ROLLBACK_MESSAGE;
+                }else{
+                    //这里返回unknown的目的是模拟执行本地事务突然宕机的情况（或者本地执行成功发送确认消息失败的场景）
+                    state = LocalTransactionState.UNKNOW;
+                }
+                System.out.println(message.getKeys() + ",state:" + state);
+                return state;
+            }
+ 
+            /**
+             * 事务消息的回查方法
+             * 用于UNKNOW
+             */
+            @Override
+            public LocalTransactionState checkLocalTransaction(MessageExt messageExt) {
+                if (null != messageExt.getKeys()) {
+                    switch (messageExt.getKeys()) {
+                        case "msg-3":
+                            System.out.println("msg-3 unknow");
+                            return LocalTransactionState.UNKNOW;
+                        case "msg-4":
+                            System.out.println("msg-4 COMMIT_MESSAGE");
+                            return LocalTransactionState.COMMIT_MESSAGE;
+                        case "msg-5":
+                            //查询到本地事务执行失败，需要回滚消息。
+                            System.out.println("msg-5 ROLLBACK_MESSAGE");
+                            return LocalTransactionState.ROLLBACK_MESSAGE;
+                    }
+                }
+                return LocalTransactionState.COMMIT_MESSAGE;
+            }
+        });
+ 
+        producer.start();
+ 
+        //模拟发送5条消息
+        for (int i = 1; i < 6; i++) {
+            try {
+                Message msg = new Message("first-topic", null, "msg-" + i, ("测试，这是事务消息！ " + i).getBytes());
+                producer.sendMessageInTransaction(msg, null);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+    }
+}
+```
+
+* 运行结果和结果分析
+  * msg-1：成功，因为一开始就返回了COMMIT_MESSAGE
+  * msg-2：失败，因为一开始就提交了回滚
+  * msg3-5：UNKNOW，进入回查，此时会间隔一小段时间就给3-5发一次消息确认
+    * msg3：因为回查一直返回的是UNKNOW，所以一直回查msg3
+    * msg4：回查返回了COMMIT_MESSAGE，所以成功发到了mq上
+    * msg5：回查返回了回滚，所以不再回查。
+
+![image-20220110112356324](rocketmq/image-20220110112356324.png)
+
 ## 安装rocket mq
 
-### 创建nameserver服务
+### 创建nameserver服务（注册broker）
 
 * 拉取镜像
 
@@ -195,7 +314,7 @@ sh mqnamesrv
 >- rocketmqinc/rocketmq	使用的镜像名称
 >- sh mqnamesrv	启动namesrv服务
 
-### 创建broke结点
+### 创建broke结点（消息转发）
 
 * 创建配置文件
 
@@ -252,7 +371,7 @@ sh mqbroker -c /opt/rocketmq-4.4.0/conf/broker.conf
 >- rocketmqinc/rocketmq	使用的镜像名称
 >- sh mqbroker -c /docker/rocketmq/conf/broker.conf	指定配置文件启动broker节点，该配置文件对应上面 vim 编辑的配置文件
 
-### 创建rockermq-console服务
+### 创建rockermq-console服务（页面显示）
 
 ```shell
 docker run -d \
@@ -267,6 +386,217 @@ styletang/rocketmq-console-ng
 ```
 
 至此，rocket-mq搭建完成，踩了许多坑，真的烦，访问地址：http://192.168.56.101:8080/#/
+
+## API学习
+
+​	这部分，分成两部分，一个部分是消息的生产，一个部分是消息的消费。
+
+### Producer
+
+​	分为同步、批量、异步和Oneway（只负责投递，不管失败还是成功）。
+
+发消息肯定要必备如下几个条件：
+
+- 指定生产组名（不能用默认的，会报错）
+- 配置namesrv地址（必须）
+- 指定topic name（必须）
+- 指定tag/key（可选）
+
+验证消息是否发送成功：消息发送完后可以启动消费者进行消费，也可以去管控台上看消息是否存在。
+
+#### send（同步）
+
+```java
+public class Product {
+    public static void main(String[] args) throws MQClientException, MQBrokerException, RemotingException, InterruptedException {
+        //指定生产组名为my-consumer-group
+        DefaultMQProducer producer = new DefaultMQProducer("my-consumer-group");
+        //配置namesrv地址
+        producer.setNamesrvAddr("192.168.56.101:9876");
+        //启动Producer
+        producer.start();
+        //创造消息对象,放入要传入的topic和消息本体
+        Message msg = new Message("first-topic","这是一个product的api".getBytes(StandardCharsets.UTF_8));
+        //发送消息到mq，同步
+        SendResult result = producer.send(msg);
+        System.out.println(result);
+        producer.shutdown();
+    }
+}
+```
+
+#### send（批量）
+
+```java
+public class ProducerMultiMsg {
+    public static void main(String[] args) throws Exception {
+        // 指定生产组名为my-producer
+        DefaultMQProducer producer = new DefaultMQProducer("my-producer");
+        // 配置namesrv地址
+        producer.setNamesrvAddr("124.57.180.156:9876");
+        // 启动Producer
+        producer.start();
+ 
+        String topic = "myTopic001";
+        // 创建消息对象，topic为：myTopic001，消息内容为：hello world1/2/3
+        Message msg1 = new Message(topic, "hello world1".getBytes());
+        Message msg2 = new Message(topic, "hello world2".getBytes());
+        Message msg3 = new Message(topic, "hello world3".getBytes());
+        // 创建消息对象的集合，用于批量发送
+        List<Message> msgs = new ArrayList<>();
+        msgs.add(msg1);
+        msgs.add(msg2);
+        msgs.add(msg3);
+        // 批量发送的api的也是send()，只是他的重载方法支持List<Message>，同样是同步发送。
+        SendResult result = producer.send(msgs);
+        System.out.println("发送消息成功！result is : " + result);
+        // 关闭Producer
+        producer.shutdown();
+        System.out.println("生产者 shutdown！");
+    }
+}
+```
+
+#### sedCallBack（异步）
+
+```java
+public class ProducerASync {
+    public static void main(String[] args) throws Exception {
+       // 指定生产组名为my-producer
+        DefaultMQProducer producer = new DefaultMQProducer("my-producer");
+        // 配置namesrv地址
+        producer.setNamesrvAddr("124.57.180.156:9876");
+        // 启动Producer
+        producer.start();
+ 
+        // 创建消息对象，topic为：myTopic001，消息内容为：hello world async
+        Message msg = new Message("myTopic001", "hello world async".getBytes());
+        // 进行异步发送，通过SendCallback接口来得知发送的结果
+        producer.send(msg, new SendCallback() {
+            // 发送成功的回调接口
+            @Override
+            public void onSuccess(SendResult sendResult) {
+                System.out.println("发送消息成功！result is : " + sendResult);
+            }
+            // 发送失败的回调接口
+            @Override
+            public void onException(Throwable throwable) {
+                throwable.printStackTrace();
+                System.out.println("发送消息失败！result is : " + throwable.getMessage());
+            }
+        });
+ 
+        Thread.sleep(1000);//这里特别注意，一定要停1s再shutdonw，否则可能没跑完就shutdown了，会报错
+ 	
+        producer.shutdown();
+        System.out.println("生产者 shutdown！");
+    }
+}
+```
+
+#### sendOneway
+
+```java
+public class ProducerOneWay {
+    public static void main(String[] args) throws Exception {
+        // 指定生产组名为my-producer
+        DefaultMQProducer producer = new DefaultMQProducer("my-producer");
+        // 配置namesrv地址
+        producer.setNamesrvAddr("124.57.180.156:9876");
+        // 启动Producer
+        producer.start();
+ 
+        // 创建消息对象，topic为：myTopic001，消息内容为：hello world oneway
+        Message msg = new Message("myTopic001", "hello world oneway".getBytes());
+        // 效率最高，因为oneway不关心是否发送成功，我就投递一下我就不管了。所以返回是void
+        producer.sendOneway(msg);
+        System.out.println("投递消息成功！，注意这里是投递成功，而不是发送消息成功哦！因为我sendOneway也不知道到底成没成功，我没返回值的。");
+        producer.shutdown();
+        System.out.println("生产者 shutdown！");
+    }
+}
+```
+
+#### 效率对比
+
+sendOneway > sendCallBack > send批量 > send单条
+
+* 很容易理解，sendOneway不求结果，我就负责投递，我不管你失败还是成功，相当于中转站，来了我就扔出去，我不进行任何其他处理。所以最快。
+
+* 而sendCallBack是异步发送肯定比同步的效率高。
+
+* send批量和send单条的效率也是分情况的，如果只有1条msg要发，那还搞毛批量，直接send单条完事。
+
+### Consumer
+
+**每个consumer只能关注一个topic。**
+
+发消息肯定要必备如下几个条件：
+
+- 指定消费组名（不能用默认的，会报错）
+- 配置namesrv地址（必须）
+- 指定topic name（必须）
+- 指定tag/key（可选）
+
+#### CLUSTERING
+
+​	集群模式，默认。
+
+​	比如启动五个Consumer，Producer生产一条消息后，Broker会选择五个Consumer中的其中一个进行消费这条消息，所以他属于点对点消费模式。
+
+发消息肯定要必备如下几个条件：
+
+- 指定消费组名（不能用默认的，会报错）
+- 配置namesrv地址（必须）
+- 指定topic name（必须）
+- 指定tag/key（可选）
+
+```java
+public class Consumer {
+    public static void main(String[] args) throws Exception {
+        // 指定消费组名为my-consumer
+        DefaultMQPushConsumer consumer = new DefaultMQPushConsumer("my-consumer");
+        // 配置namesrv地址
+        consumer.setNamesrvAddr("124.57.180.156:9876");
+        // 订阅topic：myTopic001 下的全部消息（因为是*，*指定的是tag标签，代表全部消息，不进行任何过滤）
+        consumer.subscribe("myTopic001", "*");
+        // 注册监听器，进行消息消息。
+        consumer.registerMessageListener(new MessageListenerConcurrently() {
+            @Override
+            public ConsumeConcurrentlyStatus consumeMessage(List<MessageExt> msgs, ConsumeConcurrentlyContext consumeConcurrentlyContext) {
+                for (MessageExt msg : msgs) {
+                    String str = new String(msg.getBody());
+                    // 输出消息内容
+                    System.out.println(str);
+                }
+                // 默认情况下，这条消息只会被一个consumer消费，这叫点对点消费模式。也就是集群模式。
+                // ack确认
+                return ConsumeConcurrentlyStatus.CONSUME_SUCCESS;
+            }
+        });
+        // 启动消费者
+        consumer.start();
+        System.out.println("Consumer start");
+    }
+}
+```
+
+#### BROADCASTING
+
+​	广播模式。
+
+​	比如启动五个Consumer，Producer生产一条消息后，Broker会把这条消息广播到五个Consumer中，这五个Consumer分别消费一次，每个都消费一次。
+
+```java
+// 代码里只需要添加如下这句话即可：
+consumer.setMessageModel(MessageModel.BROADCASTING); 
+```
+
+#### 两种模式对比
+
+- 集群默认是默认的，广播模式是需要手动配置。
+- 一条消息：集群模式下的多个Consumer只会有一个Consumer消费。广播模式下的每一个Consumer都会消费这条消息。
+- 广播模式下，发送一条消息后，会被当前被广播的所有Consumer消费，但是后面新加入的Consumer不会消费这条消息，很好理解：村里面大喇叭喊了全村来领鸡蛋，第二天你们村新来个人，那个人肯定听不到昨天大喇叭喊的消息呀。
 
 ## 整合Springboot和Rocket MQ
 
@@ -726,16 +1056,22 @@ JAVA_OPT="${JAVA_OPT} -Drocketmq.broker.diskSpaceWarningLevelRatio=0.99"
     public TransactionSendResult sendMessageInTransaction(final Message msg,
         final LocalTransactionExecuter localTransactionExecuter, final Object arg)
         throws MQClientException {
+        //获取事务监听器
         TransactionListener transactionListener = getCheckListener();
+        //本地事务执行器为空或事务监听器为空，则抛异常
         if (null == localTransactionExecuter && null == transactionListener) {
             throw new MQClientException("tranExecutor is null", null);
         }
-        // ignore DelayTimeLevel parameter
+        //事务消息不支持延迟特性(清空延迟等级)
         if (msg.getDelayTimeLevel() != 0) {
             MessageAccessor.clearProperty(msg, MessageConst.PROPERTY_DELAY_TIME_LEVEL);
         }
+        //判断消息对象是否为空，topic是否为空或超出长度、消息本体是否为空或者超出最大长度
+        //出现上面中的任一个问题都抛异常
         Validators.checkMessage(msg, this.defaultMQProducer);
+        //初始化用来存发送结果
         SendResult sendResult = null;
+        //预处理，在扩展字段中设置消息类型， TRAN_MSG：当前时事务half消息 / PGROUP：生产者组名
         MessageAccessor.putProperty(msg, MessageConst.PROPERTY_TRANSACTION_PREPARED, "true");
         MessageAccessor.putProperty(msg, MessageConst.PROPERTY_PRODUCER_GROUP, this.defaultMQProducer.getProducerGroup());
         try {
@@ -743,53 +1079,67 @@ JAVA_OPT="${JAVA_OPT} -Drocketmq.broker.diskSpaceWarningLevelRatio=0.99"
         } catch (Exception e) {
             throw new MQClientException("send message Exception", e);
         }
+        //设置本地事务状态为未知
         LocalTransactionState localTransactionState = LocalTransactionState.UNKNOW;
+        //设置异常为空，用于存储异常
         Throwable localException = null;
+        //使用发送状态进行选择执行
         switch (sendResult.getSendStatus()) {
-            case SEND_OK: {
-                try {
+		//half消息发送成功则执行
+            case SEND_OK: { 
+                	//保证发送消息事务的id不为空
+                	//与properties中的其他name对比，查看是否已经存在，存在抛异常
+                	//校验事务id不为空，最终，将“__transactionId__”作为key，事务id作为value存入properties中
                     if (sendResult.getTransactionId() != null) {
                         msg.putUserProperty("__transactionId__", sendResult.getTransactionId());
                     }
+                	//从msg实体中获取唯一事务id
                     String transactionId = msg.getProperty(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+                	//保证消息事务id不为空，将其放入
                     if (null != transactionId && !"".equals(transactionId)) {
                         msg.setTransactionId(transactionId);
                     }
+                    //如果本地事务执行器不为空，则使用本地事务执行器进行，返回执行结果(执行本地事务)
                     if (null != localTransactionExecuter) {
-                        localTransactionState = localTransactionExecuter.executeLocalTransactionBranch(msg, arg);
+                        localTransactionState = localTransactionExecuter.executeLocalTransactionBranch(msg, arg);				//如果监听器不为空，则执行监听器,保存本地事务执行结果（执行写的监听器）
                     } else if (transactionListener != null) {
                         log.debug("Used new transaction API");
                         localTransactionState = transactionListener.executeLocalTransaction(msg, arg);
                     }
+               		//如果本地执行状态为空，则本地消息回传为UNKNOW
                     if (null == localTransactionState) {
                         localTransactionState = LocalTransactionState.UNKNOW;
                     }
-
+					//如果执行结果不为UNKNOW也不为COMMIT_MESSAGE，则日志提示事务状态
                     if (localTransactionState != LocalTransactionState.COMMIT_MESSAGE) {
                         log.info("executeLocalTransactionBranch return {}", localTransactionState);
                         log.info(msg.toString());
                     }
+                	//捕获异常
                 } catch (Throwable e) {
                     log.info("executeLocalTransactionBranch exception", e);
                     log.info(msg.toString());
+                	//保存出现的异常状态
                     localException = e;
                 }
             }
+        		
             break;
+        	//如果预备消息half message发送超时
             case FLUSH_DISK_TIMEOUT:
             case FLUSH_SLAVE_TIMEOUT:
             case SLAVE_NOT_AVAILABLE:
-                localTransactionState = LocalTransactionState.ROLLBACK_MESSAGE;
+                localTransactionState = LocalTransactionState.ROLLBACK_MESSAGE; //返回回滚的状态
                 break;
             default:
                 break;
         }
-        try {
+        try {//最终返回half message的发送结果，本地事务执行结果，抛出的异常
             this.endTransaction(sendResult, localTransactionState, localException);
         } catch (Exception e) {
             log.warn("local transaction execute " + localTransactionState + ", but end broker transaction failed", e);
         }
-
+		//放入结果、发送状态、消息队列名、消息id、事务消息id和事务消息状态等等
         TransactionSendResult transactionSendResult = new TransactionSendResult();
         transactionSendResult.setSendStatus(sendResult.getSendStatus());
         transactionSendResult.setMessageQueue(sendResult.getMessageQueue());
@@ -797,7 +1147,9 @@ JAVA_OPT="${JAVA_OPT} -Drocketmq.broker.diskSpaceWarningLevelRatio=0.99"
         transactionSendResult.setQueueOffset(sendResult.getQueueOffset());
         transactionSendResult.setTransactionId(sendResult.getTransactionId());
         transactionSendResult.setLocalTransactionState(localTransactionState);
+		//返回这个结果状态
         return transactionSendResult;
     }
 ```
 
+​	至此消息事务消息源码解析完毕。
