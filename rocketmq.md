@@ -1,5 +1,12 @@
 # RocketMQ
 
+​	以下是Rocket MQ整个学习篇章的目录，各位可以按照以下目录来学习。
+
+* MQ的背景和选型、角色介绍、关键特性及实现原理
+* 安装Rocket MQ(这里比较复杂、会遇到很多的坑，希望大家耐心)
+* API使用和整合springboot、遇到bug结合
+* 源码解析
+
 ## MQ背景和选型
 
 消息队列作为高并发系统的核心组件之一，能够帮助业务系统解构提升开发效率和系统稳定性。主要具有以下优势:
@@ -11,42 +18,86 @@
 
 目前主流的MQ主要是Rocketmq、kafka、Rabbitmq，Rocketmq相比于Rabbitmq、kafka具有主要优势特性有:
 
-* 支持事务型消息（消息发送和DB操作保持两方的最终一致性,rabbitmq和kafka不支持)
-* 支持结合rocketmq的多个系统之间数据最终一致性(多方事务，二方事务是前提)
-* 支持延迟消息（rabbitmq和kafka不支持)
-* 支持指定次数和时间间隔的失败消息重发（kafka不支持, rabbitmq需要手动确认)
-* 支持consumer端tag过滤，减少不必要的网络传输(rabbitmq和kafka不支持)
-* 支持重复消费(rabbitmq不支持,kafka支持)
+（这里把原本的删了从阿里官网引了一份过来，更为准确）
 
-## 集群部署
+![image-20220112095124671](rocketmq/image-20220112095124671.png)
+
+## 角色介绍
 
 ![image-20211109173819998](rocketmq/image-20211109173819998.png)
 
-### Name Server
-
-Name Server是一个几乎无状态节点，可集群部署，**节点之间无任何信息同步**。类似kafka的zk，但是zk是同步的。
-
 ### Broker
 
-Broker部署相对复杂，Broker分为Master与Slave，一个Master可以对应多个Slave，但是一个Slave只能对应一个Master，Master与Slave的对应关系通过指定相同的Broker id，不同的Broker ld来定义，Brokerld为0表示Master，非0表示Slave。
+- 理解成RocketMQ本身
+- broker主要用于producer和consumer接收和发送消息
+- broker会定时向nameserver提交自己的信息
+- 是消息中间件的消息存储、转发服务器
+- 每个Broker节点，在启动时，都会遍历NameServer列表，与每个NameServer建立长连接，注册自己的信息，之后定时上报
 
-每个Broker与Name Server集群中的所有节点建立长连接，定时(每隔30s)注册Topic信息到所有NameServer。Name Server定时(每隔10s)扫描所有存活broker的连接，如果Name Server超过2分钟没有收到心跳，则Name Server断开与Broker的连接。
+### Nameserver
 
-注：和zk不同，Brocker会连接Name Server的集群上的每一个机子，将元数据（数据备份）存到上面。
+- 理解成zookeeper的效果，只是他没用zk，而是自己写了个nameserver来替代zk
+- 底层由netty实现，提供了路由管理、服务注册、服务发现的功能，是一个无状态节点
+- nameserver是服务发现者，集群中各个角色（producer、broker、consumer等）都需要定时向nameserver上报自己的状态，以便互相发现彼此，超时不上报的话，nameserver会把它从列表中剔除
+- nameserver可以部署多个，当多个nameserver存在的时候，其他角色同时向他们上报信息，以保证高可用，
+- NameServer集群间互不通信，没有主备的概念
+- nameserver内存式存储，nameserver中的broker、topic等信息默认不会持久化，所以他是无状态节点
 
-### Producer 
+### Producer
 
-Producer与Name Server集群中的其中一个节点(随机选择)建立长连接，定期从Name Server取Topic路由信息，并向提供Topic服务的Master建立长连接，且定时向Master发送心跳。Producer完全无状态，可集群部署。
-Producer每隔30s (由ClientConfifig的pollNameServerInterval)从Name server获取所有topic队列的最新情况，这意味着如果Broker不可用，Producer最多30s能够感知，在此期间内发往Broker的所有消息都会失败。
-producer每隔30s(由ClientConfifig中heartbeatBrokerInterval决定)向所有关联的broker发送心跳，Broker每隔10s中扫描所有存活的连接，如果Broker在2分钟内没有收到心跳数据，则关闭与Producer的连接。
+- 消息的生产者
+- 随机选择其中一个NameServer节点建立长连接，获得Topic路由信息（包括topic下的queue，这些queue分布在哪些broker上等等）
+- 接下来向提供topic服务的master建立长连接（因为rocketmq只有master才能写消息），且定时向master发送心跳
 
 ### Consumer
 
-consumer与Name Server集群中的其中一个节点(随机选择)建立长连接，定期从Name Server取Topic路由信息，并向提供Topic服务的Master、Slave建立长连接，且定时向Master、Slave发送心跳。Consumer既可以从Master订阅消息，也可以从Slave订阅消息，订阅规则由Broker配置决定。
-Consumer每隔30s从Name server获取topic的最新队列情况，这意味着Broker不可用时，Consumer最多最需要30s才能感知。
-Consumer每隔30s (由ClientConfifig中heartbeatBrokerInterval决定）向所有关联的broker发送心跳,Broker每隔10s扫描所有存活的连接，若某个连接2分钟内没有发送心跳数据，则关闭连接;并向该Consumer Group的所有Consumer发出通知，Group内的Consumer重新分配队列，然后继续消费。当Consumer得到master宕机通知后，转向slave消费，slave不能保证master的消息100%都同步过来了，因此会有少量的消息丢失。但是一旦master恢复，未同步过去的消息会被最终消费掉。
-消费者对列是消费者连接之后(或者之前有连接过)才创建的。我们将原生的消费者标识由 (IP}@{消费者group}扩展为{IP}@{消费者groupHtopicHtag}，（例如xXX.XXX.XXX.xxx@mqtest_producer
-group_2m2sTest_tag-zyk)。任何一个元素不同，都认为是不同的消费端，每个消费端会拥有一份自己消费对列（默认是broker对列数量*broker数量)。
+- 消息的消费者
+- 通过NameServer集群获得Topic的路由信息，连接到对应的Broker上消费消息
+- 由于Master和Slave都可以读取消息，因此Consumer会与Master和Slave都建立连接进行消费消息
+
+### 核心流程
+
+- Broker都注册到Nameserver上
+- Producer发消息的时候会从Nameserver上获取发消息的topic信息
+- Producer向提供服务的所有master建立长连接，且定时向master发送心跳
+- Consumer通过NameServer集群获得Topic的路由信息
+- Consumer会与所有的Master和所有的Slave都建立连接进行监听新消息
+
+
+
+## 消息发送详细流程
+
+​	我们来类比一下现实生活，有一个人想要给另外一个人寄快件，那么就需要先由这个人在网上查询有哪些邮局，然后选择其中一个邮局，把快件投递给它，再由邮局配送到目标人。
+
+ ![image-20220126141245381](rocketmq/image-20220126141245381.png)
+
+​	需要完成这一整个业务流程，首先需要将邮局自身的信息注册到卫星网络上，卫星负责信息的调度，这样发件人就知道有哪些邮局可以选择，收件人通过卫星网络知道快件到了哪个邮局，可以联系邮局沟通适合的配送时间，而邮局则负责接收配送存储快件。
+
+Producer：消息⽣产者，⽤于向消息服务器发送消息，就是图中的寄件人。  
+
+NameServer：路由注册中⼼，就是图中的卫星。 
+
+Broker：消息存储服务器，就是图中的邮局。
+
+Consumer：消息消费者，不是今天的重点，图中未标出，就是收件人。
+
+由此可见，NameServer作为分布式消息队列的协调者，具有信息路由注册与发现的作用。
+
+![image-20220126141822847](rocketmq/image-20220126141822847.png)
+
+上面这个故事，就讲述了NameServer路由注册的基本原理。
+
+NameServer就相当于卫星，内部会维护一个Broker表，用来动态存储Broker的信息。
+
+而Broker就相当于邮局，在启动的时候，会先遍历NameServer列表，依次发起注册请求，保持长连接，然后每隔30秒向NameServer发送心跳包，心跳包中包含BrokerId、Broker地址、Broker名称、Broker所属集群名称等等，然后NameServer接收到心跳包后，会更新时间戳，记录这个Broker的最新存活时间。
+
+NameServer在处理心跳包的时候，存在多个Broker同时操作一张Broker表，为了防止并发修改Broker表导致不安全，路由注册操作引入了ReadWriteLock读写锁，这个设计亮点允许多个消息生产者并发读，保证了消息发送时的高并发，但是同一时刻NameServer只能处理一个Broker心跳包，多个心跳包串行处理。这也是读写锁的经典使用场景，即读多写少。
+
+**总结过程**
+
+* Producer每30s发送消息给NameServer获取到broker信息表，通过信息表发送消息给broker。
+* broker每10s会注册自己的信息给NameServer上，保证自己的存活。
+* 同样的Consumer也会去向NameServer请求broker表，然后找到对应的broker获取需要的消息。
 
 ## 关键特性及实现原理
 
@@ -144,7 +195,7 @@ mq = selector.select(topicPublishinfo .getMessageQueueList( ), msg, arg);
 return this.sendKernelimpl(msg,mq，communicationMode，sendcallback,timeout )
     }
 }
-                          };
+};
 ```
 
 ### 消息重复
@@ -189,7 +240,7 @@ return this.sendKernelimpl(msg,mq，communicationMode，sendcallback,timeout )
 
 ​	补救方案：如果事务因为中断，或是其他的网络原因，导致无法立即响应的，RocketMQ当做UNKNOW处理，RocketMQ事务消息还提供了一个补救方案：定时查询事务消息的事务状态。这也是一个回调函数，这里面可以做补偿，补偿逻辑开发者自己写，成功的话自己返回commit就完事了。
 
-* 实现代码
+* 实现代码（这个实现可以等springboot整合完成再来）
 
 ```java
 import org.apache.rocketmq.client.producer.LocalTransactionState;
@@ -386,6 +437,46 @@ styletang/rocketmq-console-ng
 ```
 
 至此，rocket-mq搭建完成，踩了许多坑，真的烦，访问地址：http://192.168.56.101:8080/#/
+
+## 核心概念
+
+​	安装完了别急着开始玩，先学一下MQ特有名词，这样接受起来会比较快。
+
+### Message
+
+消息载体。Message发送或者消费的时候必须指定Topic。Message有一个可选的Tag项用于过滤消息，还可以添加额外的键值对。
+
+### topic
+
+消息的逻辑分类，发消息之前必须要指定一个topic才能发，就是将这条消息发送到这个topic上。消费消息的时候指定这个topic进行消费。就是逻辑分类。
+
+### queue
+
+1个Topic会被分为N个Queue，数量是可配置的。message本身其实是存储到queue上的，消费者消费的也是queue上的消息。多说一嘴，比如1个topic4个queue，有5个Consumer都在消费这个topic，那么会有一个consumer浪费掉了，因为负载均衡策略，每个consumer消费1个queue，5>4，溢出1个，这个会不工作。
+
+### Tag
+
+Tag 是 Topic 的进一步细分，顾名思义，标签。每个发送的时候消息都能打tag，消费的时候可以根据tag进行过滤，选择性消费。
+
+### Message Model
+
+消息模型：集群（Clustering）和广播（Broadcasting）
+
+### Message Order
+
+消息顺序：顺序（Orderly）和并发（Concurrently）
+
+### Producer Group
+
+消息生产者组
+
+### Consumer Group
+
+消息消费者组
+
+### ACK
+
+首先要明确一点：**ACK机制是发生在Consumer端的，不是在Producer端的**。也就是说Consumer消费完消息后要进行ACK确认，如果未确认则代表是消费失败，这时候Broker会进行重试策略（仅集群模式会重试）。ACK的意思就是：Consumer说：ok，我消费成功了。这条消息给我标记成已消费吧。
 
 ## API学习
 
